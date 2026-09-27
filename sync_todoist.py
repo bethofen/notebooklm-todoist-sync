@@ -22,7 +22,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 
 # --- Configuration & Constants ---
-TODOIST_API_BASE = "https://api.todoist.com/rest/v2"
+TODOIST_API_BASE = "https://api.todoist.com/api/v1"
 SCHEDULE_FILE = Path(__file__).resolve().parent / "schedule.json"
 BANGKOK_TZ = timezone(timedelta(hours=7))
 
@@ -47,7 +47,7 @@ class TodoistAPIError(Exception):
 
 
 class TodoistClient:
-    """Lightweight REST client for Todoist API v2."""
+    """Lightweight client for Todoist Unified API v1."""
 
     def __init__(self, api_token: str):
         self.session = requests.Session()
