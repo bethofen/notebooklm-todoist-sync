@@ -67,16 +67,44 @@ class TodoistClient:
         self.session.mount("http://", adapter)
 
     def get_active_tasks(self) -> List[Dict[str, Any]]:
-        """Fetch all currently active (uncompleted) tasks."""
-        try:
-            resp = self.session.get(f"{TODOIST_API_BASE}/tasks", timeout=15)
-            if resp.status_code == 401:
-                raise TodoistAPIError("Authentication failed: Invalid TODOIST_API_TOKEN.")
-            resp.raise_for_status()
-            return resp.json()
-        except requests.RequestException as e:
-            logger.error(f"Failed to fetch active tasks: {e}")
-            raise TodoistAPIError(f"Error fetching active tasks: {e}") from e
+        """Fetch all currently active (uncompleted) tasks, handling cursor pagination if present."""
+        all_tasks: List[Dict[str, Any]] = []
+        cursor: Optional[str] = None
+
+        while True:
+            params: Dict[str, Any] = {}
+            if cursor:
+                params["cursor"] = cursor
+
+            try:
+                resp = self.session.get(f"{TODOIST_API_BASE}/tasks", params=params, timeout=15)
+                if resp.status_code == 401:
+                    raise TodoistAPIError("Authentication failed: Invalid TODOIST_API_TOKEN.")
+                resp.raise_for_status()
+                data = resp.json()
+            except requests.RequestException as e:
+                logger.error(f"Failed to fetch active tasks: {e}")
+                raise TodoistAPIError(f"Error fetching active tasks: {e}") from e
+
+            if isinstance(data, list):
+                all_tasks.extend(data)
+                break
+            elif isinstance(data, dict):
+                # Todoist Unified API v1 wraps tasks in 'results' with 'next_cursor'
+                batch = data.get("results") or data.get("tasks") or data.get("items") or data.get("data")
+                if isinstance(batch, list):
+                    all_tasks.extend(batch)
+                else:
+                    logger.warning(f"Could not locate task list in response keys: {list(data.keys())}")
+
+                cursor = data.get("next_cursor")
+                if not cursor:
+                    break
+            else:
+                logger.warning(f"Unexpected response format from /tasks: {type(data).__name__}")
+                break
+
+        return all_tasks
 
     def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -90,7 +118,13 @@ class TodoistClient:
             if resp.status_code == 401:
                 raise TodoistAPIError("Authentication failed: Invalid TODOIST_API_TOKEN.")
             resp.raise_for_status()
-            return resp.json()
+            data = resp.json()
+            if isinstance(data, dict):
+                for key in ("task", "result", "data"):
+                    if key in data and isinstance(data[key], dict):
+                        return data[key]
+                return data
+            return None
         except requests.RequestException as e:
             logger.error(f"Failed to fetch task {task_id}: {e}")
             raise TodoistAPIError(f"Error fetching task {task_id}: {e}") from e
@@ -107,7 +141,13 @@ class TodoistClient:
             if resp.status_code == 401:
                 raise TodoistAPIError("Authentication failed: Invalid TODOIST_API_TOKEN.")
             resp.raise_for_status()
-            return resp.json()
+            data = resp.json()
+            if isinstance(data, dict):
+                for key in ("task", "result", "data"):
+                    if key in data and isinstance(data[key], dict):
+                        return data[key]
+                return data
+            raise TodoistAPIError(f"Unexpected response format when creating task: {data}")
         except requests.RequestException as e:
             logger.error(f"Failed to create task '{content}': {e}")
             raise TodoistAPIError(f"Error creating task: {e}") from e
@@ -256,12 +296,16 @@ def sync(api_token: str, dry_run: bool = False) -> None:
     # Step 1: Fetch active tasks from Todoist
     logger.info("Fetching active tasks from Todoist...")
     active_tasks = client.get_active_tasks()
-    active_task_ids = {str(task["id"]) for task in active_tasks}
+    active_task_ids = {str(task["id"]) for task in active_tasks if isinstance(task, dict) and "id" in task}
     logger.info(f"Found {len(active_tasks)} active tasks in Todoist.")
 
     # Step 2: Process "add:" tasks
     for task in active_tasks:
-        task_id = str(task["id"])
+        if not isinstance(task, dict):
+            continue
+        task_id = str(task.get("id", ""))
+        if not task_id:
+            continue
         content = task.get("content", "")
         description = task.get("description", "")
 
@@ -362,9 +406,13 @@ def sync(api_token: str, dry_run: bool = False) -> None:
                 schedule_changed = True
             else:
                 new_task = client.create_task(content=content, description=description, due_string="today")
-                item["active_task_id"] = str(new_task["id"])
-                schedule_changed = True
-                logger.info(f"Created task ID {item['active_task_id']} for '{item['title']}'")
+                new_id = new_task.get("id") if isinstance(new_task, dict) else None
+                if new_id:
+                    item["active_task_id"] = str(new_id)
+                    schedule_changed = True
+                    logger.info(f"Created task ID {item['active_task_id']} for '{item['title']}'")
+                else:
+                    logger.error(f"Could not extract task ID from created task: {new_task}")
 
     # Step 5: Save schedule.json if changed
     if schedule_changed:

@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 from sync_todoist import (
     INTERVALS,
+    TodoistClient,
     calculate_next_interval,
     get_bangkok_today,
     load_schedule,
@@ -16,6 +17,36 @@ from sync_todoist import (
 
 
 class TestSpacedRepetitionLogic(unittest.TestCase):
+
+    @patch("requests.Session")
+    def test_get_active_tasks_handles_paginated_results(self, mock_session_cls):
+        mock_session = MagicMock()
+        mock_session_cls.return_value = mock_session
+
+        # Mock page 1 with next_cursor, page 2 without cursor
+        mock_resp1 = MagicMock()
+        mock_resp1.status_code = 200
+        mock_resp1.json.return_value = {
+            "results": [{"id": "task-1", "content": "Task One"}],
+            "next_cursor": "cursor-abc",
+        }
+
+        mock_resp2 = MagicMock()
+        mock_resp2.status_code = 200
+        mock_resp2.json.return_value = {
+            "results": [{"id": "task-2", "content": "Task Two"}],
+            "next_cursor": None,
+        }
+
+        mock_session.get.side_effect = [mock_resp1, mock_resp2]
+
+        client = TodoistClient("dummy-token")
+        client.session = mock_session
+        tasks = client.get_active_tasks()
+
+        self.assertEqual(len(tasks), 2)
+        self.assertEqual(tasks[0]["id"], "task-1")
+        self.assertEqual(tasks[1]["id"], "task-2")
 
     def test_calculate_next_interval(self):
         # Test predefined intervals [1, 3, 7, 16, 35, 75, 180]
