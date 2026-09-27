@@ -9,8 +9,10 @@ from sync_todoist import (
     calculate_next_interval,
     get_bangkok_today,
     load_schedule,
+    match_notebook_for_deletion,
     normalize_url,
     parse_add_command,
+    parse_delete_command,
     save_schedule,
     sync,
 )
@@ -204,6 +206,86 @@ class TestSpacedRepetitionLogic(unittest.TestCase):
         self.assertIsNone(saved["active_task_id"])
         expected_next = (get_bangkok_today() + timedelta(days=3)).strftime("%Y-%m-%d")
         self.assertEqual(saved["next_review"], expected_next)
+
+    def test_parse_delete_command(self):
+        # drop: <title>
+        self.assertEqual(parse_delete_command("drop: ชีววิทยา"), "ชีววิทยา")
+        # delete: <url>
+        self.assertEqual(
+            parse_delete_command("delete: https://notebooklm.google.com/notebook/bio-1"),
+            "https://notebooklm.google.com/notebook/bio-1",
+        )
+        # del: [Title](URL)
+        self.assertEqual(
+            parse_delete_command("del: [Machine Learning](https://notebooklm.google.com/notebook/ml-1)"),
+            "https://notebooklm.google.com/notebook/ml-1",
+        )
+        # remove: with description url
+        self.assertEqual(
+            parse_delete_command("remove: Quantum Physics", description="https://notebooklm.google.com/notebook/qp-1"),
+            "https://notebooklm.google.com/notebook/qp-1",
+        )
+        # rm: keyword
+        self.assertEqual(parse_delete_command("rm: Economics"), "Economics")
+        # Non-delete task
+        self.assertIsNone(parse_delete_command("Review chapter 3"))
+
+    def test_match_notebook_for_deletion(self):
+        schedule = [
+            {"title": "ชีววิทยา ม.ปลาย", "url": "https://notebooklm.google.com/notebook/bio-123"},
+            {"title": "Quantum Physics", "url": "https://notebooklm.google.com/notebook/qp-456"},
+        ]
+        # Match by URL
+        matched = match_notebook_for_deletion("https://notebooklm.google.com/notebook/bio-123/", schedule)
+        self.assertIsNotNone(matched)
+        self.assertEqual(matched["title"], "ชีววิทยา ม.ปลาย")
+
+        # Match by exact title (case-insensitive)
+        matched = match_notebook_for_deletion("quantum physics", schedule)
+        self.assertIsNotNone(matched)
+        self.assertEqual(matched["title"], "Quantum Physics")
+
+        # Match by substring
+        matched = match_notebook_for_deletion("ชีววิทยา", schedule)
+        self.assertIsNotNone(matched)
+        self.assertEqual(matched["title"], "ชีววิทยา ม.ปลาย")
+
+        # Not found
+        self.assertIsNone(match_notebook_for_deletion("Calculus", schedule))
+
+    @patch("sync_todoist.TodoistClient")
+    @patch("sync_todoist.save_schedule")
+    @patch("sync_todoist.load_schedule")
+    def test_delete_command_sync_flow(self, mock_load, mock_save, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value = mock_client
+
+        # Active tasks has a 'drop:' command task and the old review task
+        mock_client.get_active_tasks.return_value = [
+            {"id": "cmd-drop-1", "content": "drop: ชีววิทยา", "description": ""},
+            {"id": "active-review-task-77", "content": "📚 ทบทวน: [ชีววิทยา](...)", "description": ""},
+        ]
+        mock_load.return_value = [
+            {
+                "title": "ชีววิทยา",
+                "url": "https://notebooklm.google.com/notebook/bio",
+                "reps": 2,
+                "interval": 7,
+                "next_review": "2026-10-01",
+                "active_task_id": "active-review-task-77",
+            }
+        ]
+
+        sync("fake-token")
+
+        # Should delete the associated review task
+        mock_client.delete_task.assert_any_call("active-review-task-77")
+        # Should delete the drop command task
+        mock_client.delete_task.assert_any_call("cmd-drop-1")
+        # Schedule should now be empty!
+        mock_save.assert_called_once()
+        saved = mock_save.call_args[0][1]
+        self.assertEqual(len(saved), 0)
 
 
 if __name__ == "__main__":

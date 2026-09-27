@@ -237,6 +237,75 @@ def parse_add_command(content: str, description: str = "") -> Optional[Tuple[str
     return None
 
 
+def parse_delete_command(content: str, description: str = "") -> Optional[str]:
+    """
+    Parse a 'delete: <query>', 'drop: <query>', 'del: <query>', 'remove: <query>', or 'rm: <query>' command.
+    Target query can be a URL, a Markdown link, or a notebook title/keyword.
+    """
+    if not content:
+        return None
+
+    match = re.match(r"^\s*(?:delete|drop|del|remove|rm)\s*:\s*(.+)$", content, re.IGNORECASE | re.DOTALL)
+    if not match:
+        return None
+
+    rest = match.group(1).strip()
+
+    # Case 1: Markdown link: [Title](URL) -> extract URL
+    md_match = re.search(r"\[([^\]]+)\]\s*\((https?://[^\s)]+)\)", rest)
+    if md_match:
+        return md_match.group(2).strip()
+
+    # Case 2: Raw URL in rest
+    url_match = re.search(r"(https?://\S+)", rest)
+    if url_match:
+        return url_match.group(1).strip().rstrip(")>]")
+
+    # Case 3: URL placed in description
+    if description:
+        desc_url_match = re.search(r"(https?://\S+)", description)
+        if desc_url_match:
+            return desc_url_match.group(1).strip().rstrip(")>]")
+
+    # Case 4: Title / keyword query
+    cleaned = re.sub(r"^[\s\"'\[(]+|[\s\"'\])]+$", "", rest).strip()
+    return cleaned if cleaned else None
+
+
+def match_notebook_for_deletion(query: str, schedule: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Find a notebook in schedule matching the deletion query by:
+    1. Exact normalized URL
+    2. Exact title (case-insensitive)
+    3. Substring match on title
+    """
+    if not query:
+        return None
+
+    # Check if query looks like a URL
+    if query.startswith("http://") or query.startswith("https://"):
+        norm_query = normalize_url(query)
+        for item in schedule:
+            if normalize_url(item.get("url", "")) == norm_query:
+                return item
+        return None
+
+    query_lower = query.lower()
+
+    # Check exact title match
+    for item in schedule:
+        if item.get("title", "").strip().lower() == query_lower:
+            return item
+
+    # Check substring match on title
+    for item in schedule:
+        title_lower = item.get("title", "").strip().lower()
+        if query_lower in title_lower or title_lower in query_lower:
+            return item
+
+    return None
+
+
 def normalize_url(url: str) -> str:
     """Normalize URL by stripping trailing slash for exact deduplication."""
     return url.strip().rstrip("/")
@@ -299,7 +368,44 @@ def sync(api_token: str, dry_run: bool = False) -> None:
     active_task_ids = {str(task["id"]) for task in active_tasks if isinstance(task, dict) and "id" in task}
     logger.info(f"Found {len(active_tasks)} active tasks in Todoist.")
 
-    # Step 2: Process "add:" tasks
+    # Step 2: Process user commands from Todoist
+    # 2.1 Process 'delete:' / 'drop:' / 'remove:' tasks
+    for task in active_tasks:
+        if not isinstance(task, dict):
+            continue
+        task_id = str(task.get("id", ""))
+        content = task.get("content", "")
+        description = task.get("description", "")
+
+        del_query = parse_delete_command(content, description)
+        if not del_query:
+            continue
+
+        matched_item = match_notebook_for_deletion(del_query, schedule)
+        if matched_item:
+            title_to_del = matched_item.get("title", "Unknown")
+            logger.info(f"Command '{content}' matches notebook '{title_to_del}'. Removing from schedule...")
+
+            # Clean up active review task in Todoist if one is open
+            active_rev_id = matched_item.get("active_task_id")
+            if active_rev_id and not dry_run:
+                logger.info(f"Deleting associated review task ID {active_rev_id} from Todoist...")
+                client.delete_task(str(active_rev_id))
+                active_task_ids.discard(str(active_rev_id))
+
+            schedule.remove(matched_item)
+            if "url" in matched_item:
+                existing_urls.pop(normalize_url(matched_item["url"]), None)
+            schedule_changed = True
+            logger.info(f"Successfully deleted notebook '{title_to_del}' from spaced repetition.")
+        else:
+            logger.warning(f"Delete command target '{del_query}' did not match any notebook in schedule.")
+
+        if not dry_run and task_id:
+            logger.info(f"Cleaning up command task ID {task_id} from Todoist...")
+            client.delete_task(task_id)
+
+    # 2.2 Process "add:" tasks
     for task in active_tasks:
         if not isinstance(task, dict):
             continue
